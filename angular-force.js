@@ -19,23 +19,38 @@
 angular.module('AngularForce', []).
     service('AngularForce', function (SFConfig) {
 
-        this.version = '0.1';
+        var self = this;
 
-        this.inVisualforce = document.location.href.indexOf('visual.force.com') > 0;
+        var href =  document.location.href;
+        this.inVisualforce = href.indexOf('visual.force.com') > 0 || href.indexOf('salesforce.com/apex/') > 0;
+        
+        this.refreshToken = localStorage.getItem('ftkui_refresh_token');
+
+        this.isOnline = function () {
+            return navigator.onLine ||
+                (typeof navigator.connection != 'undefined' &&
+                    navigator.connection.type !== Connection.UNKNOWN &&
+                    navigator.connection.type !== Connection.NONE);
+        };
 
         this.authenticated = function () {
             return SFConfig.client ? true : false;
         };
+
 
         this.login = function (callback) {
             if (SFConfig.client) { //already logged in
                 return callback && callback();
             }
 
+            //if offline..
+            if (!this.isOnline()) {
+                return callback && callback();
+            }
             if (location.protocol === 'file:' && cordova) { //Cordova / PhoneGap
                 return this.setCordovaLoginCred(callback);
-            } else if (SFConfig.inVisualforce) { //visualforce
-                return this.loginVF();
+            } else if (this.inVisualforce) { //visualforce
+                return this.loginVF(callback);
             } else { //standalone / heroku / localhost
                 return this.loginWeb(callback);
             }
@@ -65,7 +80,11 @@ angular.module('AngularForce', []).
                 SFConfig.client = new forcetk.Client(credsData.clientId, credsData.loginUrl);
                 SFConfig.client.setSessionToken(credsData.accessToken, apiVersion, credsData.instanceUrl);
                 SFConfig.client.setRefreshToken(credsData.refreshToken);
-                callback();
+
+                //Set sessionID to angularForce coz profileImages need them
+                self.sessionId = SFConfig.client.sessionId;
+
+                callback && callback();
             }
 
             function getAuthCredentialsError(error) {
@@ -84,8 +103,8 @@ angular.module('AngularForce', []).
             if (SFConfig.client) { //already loggedin
                 return callback && callback();
             }
-            var ftkClientUI = getForceTKClientUI();
-            ftkClientUI.login(callback);
+            var ftkClientUI = getForceTKClientUI(callback);
+            ftkClientUI.login();
         };
 
         /**
@@ -96,9 +115,17 @@ angular.module('AngularForce', []).
          *
          * @param callback A callback function (usually in the same controller that initiated login)
          */
-        this.loginVF = function () {
+        this.loginVF = function (callback) {
             SFConfig.client = new forcetk.Client();
             SFConfig.client.setSessionToken(SFConfig.sessionId);
+
+                initApp(null, SFConfig.client, SFConfig); //init entity framework
+
+                //Set sessionID to angularForce coz profileImages need them
+                self.sessionId = SFConfig.client.sessionId;
+
+                //If callback is passed, call it.
+                callback && callback();
         };
 
 
@@ -126,19 +153,36 @@ angular.module('AngularForce', []).
          *
          * @returns {forcetk.ClientUI}
          */
-        function getForceTKClientUI() {
+        function getForceTKClientUI(callback) {
+
+            function forceOAuthUI_successHandler(forcetkClient, rawResponse) {
+                console.log('OAuth callback success!');
+                SFConfig.client = forcetkClient;
+                SFConfig.client.userURL = rawResponse.id;
+                SFConfig.client.serviceURL = forcetkClient.instanceUrl
+                    + '/services/data/'
+                    + forcetkClient.apiVersion;
+
+                initApp(null, forcetkClient, SFConfig);
+
+                //Set sessionID to angularForce coz profileImages need them
+                self.sessionId = SFConfig.client.sessionId;
+
+                //If callback is passed, call it.
+                callback && callback();
+            }
+
+            function forceOAuthUI_errorHandler() {
+                //If callback is passed, call it.
+                callback && callback();
+            }
+
             return new forcetk.ClientUI(SFConfig.sfLoginURL, SFConfig.consumerKey, SFConfig.oAuthCallbackURL,
-                function forceOAuthUI_successHandler(forcetkClient) {
-                    console.log('OAuth callback success!');
-                    SFConfig.client = forcetkClient;
-                    SFConfig.client.serviceURL = forcetkClient.instanceUrl
-                        + '/services/data/'
-                        + forcetkClient.apiVersion;
-                },
-                function forceOAuthUI_errorHandler() {
-                },
-                SFConfig.proxyUrl);
+                forceOAuthUI_successHandler, forceOAuthUI_errorHandler, SFConfig.proxyUrl);
         }
+
+
+
     });
 
 /**
@@ -155,7 +199,7 @@ angular.module('AngularForce', []).
  * var Opportunity = AngularForceObjectFactory({type: 'Opportunity', fields:
  *          ['Name', 'ExpectedRevenue', 'StageName', 'CloseDate', 'Id'], where: 'WHERE IsWon = TRUE'});
  */
-angular.module('AngularForceObjectFactory', []).factory('AngularForceObjectFactory', function (SFConfig) {
+angular.module('AngularForceObjectFactory', []).factory('AngularForceObjectFactory', function (SFConfig, AngularForce) {
     function AngularForceObjectFactory(params) {
         params = params || {};
         var type = params.type;
@@ -163,6 +207,7 @@ angular.module('AngularForceObjectFactory', []).factory('AngularForceObjectFacto
         var where = params.where;
         var limit = params.limit;
         var orderBy = params.orderBy;
+        var soslFields = params.soslFields || 'ALL FIELDS';
         var fieldsArray = angular.isArray(params.fields) ? params.fields : [];
 
         //Make it soql compliant
@@ -172,11 +217,11 @@ angular.module('AngularForceObjectFactory', []).factory('AngularForceObjectFacto
         orderBy = orderBy && orderBy != '' ? ' ORDER BY ' + orderBy : '';
 
         //Construct SOQL
-        var soql = 'SELECT ' + fields + ' FROM ' + type + where + orderBy + limit;
+        var soql = 'SELECT ' + fields + ' FROM ' + type + where + orderBy;
 
         //Construct SOSL
         // Note: "__SEARCH_TERM_PLACEHOLDER__" will be replaced by actual search query just before making that query
-        var sosl = 'Find {__SEARCH_TERM_PLACEHOLDER__*} IN ALL FIELDS RETURNING ' + type + ' (' + fields + ')';
+        var sosl = 'Find {__SEARCH_TERM_PLACEHOLDER__*} IN ' + soslFields + ' RETURNING ' + type + ' (' + fields + ')';
 
         /**
          * AngularForceObject acts like a super-class for actual SF Objects. It provides wrapper to forcetk ajax apis
@@ -208,57 +253,84 @@ angular.module('AngularForceObjectFactory', []).factory('AngularForceObjectFacto
             return AngularForceObject.remove(this, successCB, failureCB);
         };
 
+
+        AngularForceObject.prototype.setWhere = function (whereClause) {
+            where = whereClause;
+        };
+
         AngularForceObject.query = function (successCB, failureCB) {
-            return SFConfig.client.query(soql, successCB, failureCB);
+            return AngularForceObject.queryWithCustomSOQL(soql, successCB, failureCB);
+        };
+
+        AngularForceObject.queryWithCustomSOQL = function (soql, successCB, failureCB) {
+            // return SFConfig.client.query(soql, successCB, failureCB);
+
+            var self = this;
+            var config = {};
+
+            // fetch list from forcetk and populate SOBject model
+            if (AngularForce.isOnline()) {
+                config.type = 'soql';
+                config.query = soql;
+
+            } else if (navigator.smartstore) {
+                config.type = 'cache';
+                config.cacheQuery = navigator.smartstore.buildExactQuerySpec('attributes.type', type);
+            }
+
+            return Force.fetchSObjects(config, SFConfig.dataStore).done(function (resp) {
+                var processFetchResult = function (records) {
+                    //Recursively get records until no more records or maxListSize
+                    if (resp.hasMore() && (SFConfig.maxListSize || 25) > resp.records.length) {
+                        resp.getMore().done(processFetchResult);
+
+                    } else {
+                        return successCB(resp);
+                    }
+                }
+                processFetchResult(resp.records);
+
+            }).fail(failureCB);
         };
 
         /*RSC And who doesn't love SOSL*/
         AngularForceObject.search = function (searchTerm, successCB, failureCB) {
 
             //Replace __SEARCH_TERM_PLACEHOLDER__ from SOSL with actual search term.
-            var s = sosl.replace('__SEARCH_TERM_PLACEHOLDER__', escape(searchTerm));
+            var s = sosl.replace('__SEARCH_TERM_PLACEHOLDER__', searchTerm);
             return SFConfig.client.search(s, successCB, failureCB);
         };
 
 
         AngularForceObject.get = function (params, successCB, failureCB) {
-            return SFConfig.client.retrieve(type, params.id, fieldsArray, function (data) {
-                if (data && !angular.isArray(data)) {
-                    return successCB(new AngularForceObject(data))
-                }
-                return successCB(data);
-            }, failureCB);
+            return Force.syncSObject('read', type, params.id, null, fieldsArray, SFConfig.dataStore, AngularForce.isOnline() ? Force.CACHE_MODE.SERVER_FIRST : Force.CACHE_MODE.CACHE_ONLY)
+                .done(function (data) {
+                    return successCB(new AngularForceObject(data));
+                }).fail(failureCB);
         };
 
         AngularForceObject.save = function (obj, successCB, failureCB) {
             var data = AngularForceObject.getNewObjectData(obj);
-            return SFConfig.client.create(type, data, function (data) {
-                if (data && !angular.isArray(data)) {
-                    //Salesforce returns "id" in lowercase when an object is
-                    //created. Where as it returns id as "Id" for every other call.
-                    // This might confuse people, so change "id" to "Id".
-                    if (data.id) {
-                        data.Id = data.id;
-                        delete data.id;
-                    }
-                    return successCB(new AngularForceObject(data))
-                }
-                return successCB(data);
-            }, failureCB);
+
+            return Force.syncSObject('create', type, null, data, fieldsArray, SFConfig.dataStore, AngularForce.isOnline() ? Force.CACHE_MODE.SERVER_FIRST : Force.CACHE_MODE.CACHE_ONLY)
+                .done(function (data) {
+                    return successCB(new AngularForceObject(data));
+                }).fail(failureCB);
         };
 
         AngularForceObject.update = function (obj, successCB, failureCB) {
-            var data = AngularForceObject.getChangedData(obj);
-            return SFConfig.client.update(type, obj.Id, data, function (data) {
-                if (data && !angular.isArray(data)) {
-                    return successCB(new AngularForceObject(data))
-                }
-                return successCB(data);
-            }, failureCB);
+            var changedData = AngularForceObject.getChangedData(obj);
+            return Force.syncSObject('update', type, obj.Id, changedData, _.keys(changedData), SFConfig.dataStore, AngularForce.isOnline() ? Force.CACHE_MODE.SERVER_FIRST : Force.CACHE_MODE.CACHE_ONLY)
+                .done(function (data) {
+                    return successCB(new AngularForceObject(data));
+                }).fail(failureCB);
         };
 
         AngularForceObject.remove = function (obj, successCB, failureCB) {
-            return SFConfig.client.del(type, obj.Id, successCB, failureCB);
+            return Force.syncSObject('delete', type, obj.Id, null, null, SFConfig.dataStore, AngularForce.isOnline() ? Force.CACHE_MODE.SERVER_FIRST : Force.CACHE_MODE.CACHE_ONLY)
+                .done(function (data) {
+                    return successCB(new AngularForceObject(data));
+                }).fail(failureCB);
         };
 
         /************************************
@@ -283,6 +355,7 @@ angular.module('AngularForceObjectFactory', []).factory('AngularForceObjectFacto
             });
             return newObj;
         };
+
 
         return AngularForceObject;
     }
